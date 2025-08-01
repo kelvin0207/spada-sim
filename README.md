@@ -29,3 +29,10 @@ If you use this tool in your research, please kindly cite the following paper.
 Zhiyao Li, Jiaxiang Li, Taijie Chen, Dimin Niu, Hongzhong Zheng, Yuan Xie, and Mingyu Gao.
 Spada: Accelerating Sparse Matrix Multiplication with Adaptive Dataflow.
 In *Proceedings of the 28th International Conference on Architectural Support for Programming Languages and Operating Systems* (ASPLOS), 2023.
+
+---
+
+# SPADA 模拟器的解读分析
+
+该项目是 SpGEMM（稀疏矩阵乘法）加速器模拟器，支持多种数据流架构（如 Ip、MultiRow、Op、Spada）。
+核心目标是通过周期精确的模拟，评估不同数据流在稀疏矩阵乘法中的性能（如执行周期、存储访问等）。
