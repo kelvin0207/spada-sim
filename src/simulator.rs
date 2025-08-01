@@ -407,6 +407,9 @@ impl PE {
     }
 }
 
+// 生命周期标注'a：
+// 表示结构体内部包含具有生命周期的引用（如代码中a_matrix字段是&'a mut CsrMatStorage类型），
+// 确保结构体实例的生命周期不超过它所引用数据的生命周期，这是 Rust 内存安全的核心保障。
 pub struct Simulator<'a> {
     pe_num: usize,
     adder_tree_num: usize,
