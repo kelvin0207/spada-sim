@@ -411,8 +411,11 @@ impl PE {
 // 表示结构体内部包含具有生命周期的引用（如代码中a_matrix字段是&'a mut CsrMatStorage类型），
 // 确保结构体实例的生命周期不超过它所引用数据的生命周期，这是 Rust 内存安全的核心保障。
 pub struct Simulator<'a> {
+    // PE 应该指的是 MPE
     pe_num: usize,
+    // adder tree 指的是 APE
     adder_tree_num: usize,
+    // 一条lane对应一个乘法器、B fetcher和P queue的通道
     lane_num: usize,
     fiber_cache: LatencyPriorityCache<'a>,
     pes: Vec<PE>,
@@ -425,6 +428,7 @@ pub struct Simulator<'a> {
     pub channel: usize,
     pub word_cycle_chan_bw: f32,
     // Debug info.
+    // 排空周期：处理单元或整个模拟器完成所有剩余数据处理所需的额外周期数
     pub drain_cycles: Vec<usize>,
     pub mult_util: Vec<f32>,
     pub active_cycle: Vec<usize>,
@@ -512,14 +516,15 @@ impl<'a> Simulator<'a> {
     pub fn execute(&mut self) {
         // Reset the execution round counter.
         self.exec_cycle = 0;
+        // Step 0: 初始化与循环框架
         loop {
             trace_println!("\n---- cycle {}", self.exec_cycle);
-
-            let mut prev_a_rs = vec![0; self.pe_num];
-            let mut prev_b_rs = vec![0; self.pe_num];
-            let mut prev_psum_rs = vec![0; self.pe_num];
-            let mut prev_psum_ws = vec![0; self.pe_num];
-            let prev_cache_miss = self.fiber_cache.miss_count;
+            // 统计变量初始化
+            let mut prev_a_rs = vec![0; self.pe_num]; // 记录A矩阵读操作计数（周期开始前）
+            let mut prev_b_rs = vec![0; self.pe_num]; // 记录B矩阵读操作计数
+            let mut prev_psum_rs = vec![0; self.pe_num]; // 记录psum（部分和）读操作计数
+            let mut prev_psum_ws = vec![0; self.pe_num]; // 记录psum写操作计数
+            let prev_cache_miss = self.fiber_cache.miss_count; // 缓存缺失计数
             let prev_b_evict = self.fiber_cache.b_evict_count;
             let prev_psum_evict = self.fiber_cache.psum_evict_count;
             let mut prev_cache_rs = vec![0; self.pe_num];
@@ -529,6 +534,7 @@ impl<'a> Simulator<'a> {
             self.fiber_cache.print_psums();
 
             // Fetch data stage.
+            // 遍历所有 PE，处理数据获取、任务调度和状态更新，是每个周期的核心准备工作。
             for pe_idx in 0..self.pe_num {
                 trace_println!("\n---pe {}", pe_idx);
                 // Pending when access a or b matrix.
@@ -545,6 +551,7 @@ impl<'a> Simulator<'a> {
                 prev_cache_ws[pe_idx] = self.fiber_cache.write_count;
                 trace_println!("idle: {}", self.pes[pe_idx].idle());
                 // Track drain cycle.
+                // is_some()返回 true 表示该 PE 当前有任务在运行（task 不是 None）。
                 if self.pes[pe_idx].task.is_some()
                     && self.pes[pe_idx].drain_cycle.is_none()
                     && self
@@ -562,8 +569,11 @@ impl<'a> Simulator<'a> {
                     && self.pes[pe_idx].idle()
                 {
                     // Stat the memory transfer cycle and calc the overlapped latency.
+                    // 内存完成周期未记录的时候
                     if self.pes[pe_idx].mem_finish_cycle.is_none() {
+                        // 1. 判断PE是否有任务
                         if self.pes[pe_idx].task.is_some() {
+                            // 2. 获取任务的引用并打印基本信息
                             let task = self.pes[pe_idx].task.as_ref().unwrap();
                             print!("pe: {} cur_cycle: {} ", pe_idx, self.exec_cycle);
                             if task.merge_mode {
@@ -617,13 +627,21 @@ impl<'a> Simulator<'a> {
 
                         if self.pes[pe_idx].mem_finish_cycle.is_some() {
                             // Add to discount drain cycle.
+                            // 1. 计算drain_cycle（排空持续周期）,
+                            // 若 PE 已开始排空（drain_cycle已设置），
+                            // 则drain_cycle为当前周期 - 开始排空的周期，
+                            // 即从开始排空到现在已经过的时间。
                             let drain_cycle = if self.pes[pe_idx].drain_cycle.is_some() {
                                 self.exec_cycle - *self.pes[pe_idx].drain_cycle.as_ref().unwrap()
                             } else {
                                 0
                             };
+                            // mem_exec_cycle（内存操作完成时间）
+                            // 直接取mem_finish_cycle的值，即内存操作（如数据加载 / 存储）全部完成的时间点
                             let mem_exec_cycle =
                                 *self.pes[pe_idx].mem_finish_cycle.as_ref().unwrap();
+                            // 有效执行周期：排除排空阶段后的 “有效执行时间”
+                            // （即 PE 在处理正常任务而非排空时的时间）。
                             let discounted_exec_cycle = self.exec_cycle - drain_cycle;
                             if self.exec_cycle > mem_exec_cycle && self.pes[pe_idx].config_unchanged
                             {
@@ -694,9 +712,10 @@ impl<'a> Simulator<'a> {
                         &mut self.a_matrix,
                         self.exec_cycle,
                     );
-                    let latency = self.pes[pe_idx].set_task(task);
-                    self.a_pending_cycle[pe_idx] += latency;
+                    let latency = self.pes[pe_idx].set_task(task); // 配置PE并获取延迟
+                    self.a_pending_cycle[pe_idx] += latency; // 更新挂起周期
                 }
+                // 打印任务调度信息
                 if self.pes[pe_idx].task.is_some() {
                     let block_token = self.pes[pe_idx].task.as_ref().unwrap().block_token;
                     let block_tracker = &self.scheduler.block_tracker[&block_token];
@@ -728,13 +747,20 @@ impl<'a> Simulator<'a> {
                 }
 
                 // Stream buffer fetch data.
+                // 每个 PE 包含多个并行通道（lane），
+                // 每个通道对应独立的流缓冲区、乘法器等组件。
+                // 遍历通道以分别处理每个通道的数据获取。
                 for lane_idx in 0..self.lane_num {
+                    //  计算当前流缓冲区已使用空间（sb_len）
                     let sb_len = self.pes[pe_idx].stream_buffers[lane_idx]
                         .iter()
                         .filter(|e| e.idx[0] != usize::MAX)
                         .count();
+                    // 计算可读取的最大元素数量（rb_num）
                     let rb_num = self.pes[pe_idx].stream_buffer_size - sb_len;
+                    // 从存储系统读取 B 矩阵元素（stream_b_row）
                     let bs = self.stream_b_row(pe_idx, lane_idx, rb_num, self.exec_cycle);
+                    // 将读取的元素推入流缓冲区
                     self.pes[pe_idx].push_stream_buffer(lane_idx, bs);
                 }
 
@@ -838,10 +864,14 @@ impl<'a> Simulator<'a> {
                 }
             }
 
+            // 加法树执行，用于更高层次的部分和合并
+            // （MPE只关注两个psum向量合并，高阶的需要借助APE）
             for idx in 0..self.adder_tree_num {
                 self.adder_tree_exec(idx);
             }
-
+            
+            // Step0: recall 退出循环
+            // 退出条件：所有任务完成（A矩阵遍历完毕，所有PE和加法树空闲）
             if self.scheduler.a_traversed
                 && self.pes.iter().all(|p| p.idle() && p.task.is_none())
                 && self

@@ -195,13 +195,13 @@ cycle_simu.execute();
 
 ### Simulator
 
-定义
+定义如下：
 
 ```rust
 pub struct Simulator<'a> {
-    pe_num: usize,
-    adder_tree_num: usize,
-    lane_num: usize,
+    pe_num: usize, // MPE
+    adder_tree_num: usize, // APE
+    lane_num: usize, // 一条lane对应一个乘法器、B fetcher和P queue的通道
     fiber_cache: LatencyPriorityCache<'a>,
     pes: Vec<PE>,
     a_matrix: &'a mut CsrMatStorage,
@@ -213,55 +213,222 @@ pub struct Simulator<'a> {
     pub channel: usize,
     pub word_cycle_chan_bw: f32,
     // Debug info.
-    pub drain_cycles: Vec<usize>,
+    pub drain_cycles: Vec<usize>, // 处理单元完成剩余数据处理所需的额外周期数
     pub mult_util: Vec<f32>,
     pub active_cycle: Vec<usize>,
 }
 ```
 
+`Simulator`的核心函数是`execute()`，下面我们将来详细拆解：
 
+#### Step0: 初始化与循环架构
 
-1. **PE（处理单元）**：`PE` 结构体是数据流处理的核心，包含：
-   - `stream_buffers`：输入数据缓冲区（存储待处理的矩阵元素）。
-   - `multiplier_array`：乘法器阵列（执行元素乘法）。
-   - `sorting_network` 和 `merge_tree`：处理乘法结果的排序与合并（稀疏矩阵乘法中关键步骤）。
-   - `task`：当前执行的任务（由调度器分配，包含数据流相关配置，如 `group_size`）。
+首先重置执行周期计数器 `exec_cycle`，然后进入主循环（每个迭代代表一个时钟周期），直到所有任务完成才退出。核心逻辑围绕 “每周期处理所有 PE（处理单元）和加法树（AdderTree）的操作” 展开。由此可见这是一个**周期精确模拟器**，按周期逐个推进。
 
-2. **关键组件逻辑**：
-   - `MultiplierArray`：实现矩阵元素的乘法，其 `multiply` 方法中通过 `group_size` 控制数据匹配逻辑（不同数据流可能有不同的分组策略）。
-   - `SortingNetwork` 和 `MergeTree`：处理乘法结果的排序和累加（稀疏矩阵中需按列索引合并相同位置的结果），其延迟和并行度直接影响数据流的效率。
+```rust
+pub fn execute(&mut self) {
+    self.exec_cycle = 0;  // 重置周期计数器
+    loop {  // 按时钟周期迭代
+        trace_println!("\n---- cycle {}", self.exec_cycle);  // 打印当前周期
+        // 统计变量初始化
+        let mut prev_a_rs = vec![0; self.pe_num]; // 记录A矩阵读操作计数
+        let mut prev_b_rs = vec![0; self.pe_num]; // 记录B矩阵读操作计数
+        let mut prev_psum_rs = vec![0; self.pe_num]; // 记录psum读操作计数
+        
+        // 遍历所有 PE，处理数据获取、任务调度和状态更新，是每个周期的核心准备工作。
+        for pe_idx in 0..self.pe_num {
+        // ... 核心逻辑（见下文各Steps）
+        }
 
-重点关注：`PE` 的 `idle` 方法（判断当前处理单元是否空闲）、`update_tail_flags` 方法（跟踪数据处理进度），这些逻辑反映了数据流的推进方式。
+        // 加法树执行，用于更高层次的部分和合并
+        // （MPE只关注两个psum向量合并，高阶的需要借助APE）
+        for idx in 0..self.adder_tree_num {
+            self.adder_tree_exec(idx);
+        }
 
+        // 退出条件：所有任务完成（A矩阵遍历完毕，所有PE和加法树空闲）
+        if self.scheduler.a_traversed
+            && self.pes.iter().all(|p| p.idle() && p.task.is_none())
+            && self.adder_trees.iter().all(|a| a.idle() && a.task.is_none())
+        {
+            break;
+        }
+        // 打印信息，周期+1
+        self.exec_cycle += 1;  // 周期递增
+    }
+}
+```
 
-### **第四步：分析调度器与任务分配（数据流的驱动逻辑）**
-不同数据流的核心差异体现在任务的调度方式上，对应 `src/scheduler.rs`（虽未完全提供代码，但可结合 `simulator.rs` 推测）：
-- **任务（Task）**：每个任务包含矩阵块的范围、分组大小（`group_size`）等信息，决定了数据如何被分配到 PE 中处理。
-- **调度策略**：调度器根据加速器类型（如 `Spada`）将矩阵划分为块，分配给不同 PE，并协调数据在 PE 间的流动（如行优先、列优先或自适应方式）。
+下面各Step都是在遍历 pe 的 for 循环里面：
 
-结合 `simulator.rs` 中 `PE` 的 `task` 字段，可推断：不同数据流（如 `Ip` 与 `Spada`）的任务结构不同，导致数据加载、乘法、合并的顺序和并行度存在差异。
+#### Step1: 处理挂起周期
 
+如果 MPE 的A窗口或B rows还没有处理完，暂时挂起，周期-1。pending cycles是在将负载load上MPE时确定的，往后`每周期-1`即可。
 
-### **第五步：跟踪数据在存储与计算间的流动**
-数据流的效率很大程度依赖于存储访问模式，相关逻辑在 `src/storage.rs` 和 `src/storage_traffic_model.rs` 中：
-1. **存储访问**：`storage.rs` 中的 `request_read_scalars` 方法处理数据读取请求，根据缓存命中情况（`rowmap`）决定从缓存还是内存加载数据，不同数据流会有不同的访问模式（如是否连续访问、是否复用数据）。
-2. **流量模型**：`storage_traffic_model.rs` 中的 `TrafficModel` 跟踪数据块的访问、复用和缓存行为，通过 `exec_trackers` 记录不同数据流的存储流量指标（如 `c_reuse`、`b_reuse` 复用率）。
+```rust
+if self.a_pending_cycle[pe_idx] > 0 {
+    self.a_pending_cycle[pe_idx] -= 1;
+    continue;
+}
+```
 
-重点关注：不同数据流如何通过 `block_shape`（块形状）影响数据块的划分，进而影响存储访问的局部性和效率。
+#### Step2: 跟踪 PE 状态与排空周期（Drain Cycle）
 
+**当 PE 正在执行任务（`task.is_some()`）、且尚未记录过排空周期（`drain_cycle.is_none()`）、且该任务的窗口已完成（`is_window_finished`）时，就把当前周期记为排空阶段的开始时间。**
 
-### **第六步：聚焦特定数据流的差异化实现**
-项目支持多种加速器架构（数据流），其差异化逻辑主要体现在：
-1. **frontend.rs**：`Accelerator` 枚举定义了支持的数据流类型（`Ip`、`MultiRow`、`Op`、`Spada`），初始化时会根据此类型配置模拟器参数（如 `default_block_shape`）。
-2. **simulator.rs**：`Simulator` 的 `execute` 方法（未完全展示）会根据加速器类型选择不同的任务调度和数据处理流程。例如，`Spada` 的自适应数据流可能会动态调整 `block_shape` 或 `group_size`，而 `Ip`（内积）数据流可能采用固定的块划分。
-3. **调整策略**：`rowwise_adjust.rs`、`colwise_reg_adjust.rs` 等文件可能包含针对行优先、列优先数据流的调整逻辑（如块大小适配、延迟优化）。
+- 检查 PE 是否空闲（`idle()` 方法：流缓冲区、乘法器、psum 缓冲区等均为空）。`is_some()`返回 `true` 表示该 PE 当前**有任务在运行**（`task` 不是 `None`）,`is_none()`同理。
+- 当 PE 的任务窗口完成且尚未记录排空周期时，记录当前周期为排空开始周期（用于统计处理剩余数据的额外开销）。
 
+```rust
+if self.pes[pe_idx].task.is_some()
+    && self.pes[pe_idx].drain_cycle.is_none()
+    && self.scheduler.is_window_finished(self.pes[pe_idx].task.as_ref().unwrap().window_token)
+{
+    self.pes[pe_idx].drain_cycle = Some(self.exec_cycle);  // 记录排空开始周期
+}
+```
 
-### **总结阅读路径**
-1. **整体流程**：`main.rs` → 理解程序入口和初始化逻辑。
-2. **硬件抽象**：`simulator.rs` → 掌握 PE 及核心组件（乘法器、排序网络等）的工作方式。
-3. **调度与任务**：`scheduler.rs`（结合 `simulator.rs` 的 `task` 处理）→ 分析不同数据流的任务分配策略。
-4. **存储交互**：`storage.rs` + `storage_traffic_model.rs` → 理解数据访问模式与流量模型。
-5. **差异化实现**：`frontend.rs`（加速器类型）+ 调整策略文件 → 对比不同数据流的核心差异。
+#### Step3: 任务调度与分配
 
-通过以上步骤，可逐步理清不同数据流在模拟过程中的数据路径、调度逻辑和性能优化点。
+当 PE 无任务、任务已完成且处于空闲状态时，从调度器（`scheduler`）分配新任务，并更新 PE 状态。
+
+- 统计上一个任务的内存传输延迟、执行周期等信息，更新调度器的延迟跟踪器。
+- 清理上一个任务的资源，调用 `scheduler.assign_task` 获取新任务，并通过 `PE::set_task` 配置 PE。
+- 处理任务分配后的挂起周期（如访问 A 矩阵的延迟）。
+
+```rust
+if (self.pes[pe_idx].task.is_none() || self.scheduler.is_window_finished(...)) && self.pes[pe_idx].idle() {
+    // 统计上一个任务的内存和执行周期
+    // ...（下面具体解读）
+    
+    // 分配新任务
+    let task = self.scheduler.assign_task(&mut self.pes[pe_idx], &mut self.a_matrix, self.exec_cycle);
+    let latency = self.pes[pe_idx].set_task(task);  // 配置PE并获取延迟
+    self.a_pending_cycle[pe_idx] += latency;  // 更新挂起周期
+}
+```
+
+下面讲解如何统计上一个任务的内存和执行周期：
+
+**Step3.1. 内存传输周期与延迟**
+
+```rust
+//内存操作完成周期（mem_finish_cycle）未记录时 
+if self.pes[pe_idx].mem_finish_cycle.is_none() {
+    // 1. 判断PE是否有任务，有任务时的处理（核心逻辑）
+    if self.pes[pe_idx].task.is_some() {
+        // 2. 获取任务的引用并打印基本信息
+        let task = self.pes[pe_idx].task.as_ref().unwrap();
+        print!(...)
+        // 3. 非合并模式，延迟取两个值的最大值，并累加到调度器的行延迟调整跟踪器中
+        if !task.merge_mode {
+            let latency = max(comp_cycle, mem_cycle);
+            self.scheduler....add_assign(latency);
+        }
+        // 4. 计算内存操作的完成周期
+        self.pes[pe_idx].mem_finish_cycle = Some(task.start_cycle + (task.memory_traffic / mem_bw));
+    }
+    // 1. PE 无任务
+    else {self.pes[pe_idx].mem_finish_cycle = None;}
+    // 5. 计算具体时间
+    if self.pes[pe_idx].mem_finish_cycle.is_some() {
+        // 6. 计算从开始排空到当前的周期数
+        let drain_cycle = if self.pes[pe_idx].drain_cycle.is_some() {
+            self.exec_cycle - *self.pes[pe_idx].drain_cycle.as_ref().unwrap()
+        } else {0};
+        // 7. 获取内存操作完成的周期
+        let mem_exec_cycle = *self.pes[pe_idx].mem_finish_cycle.as_ref().unwrap();
+        // 8. 计算排除排空阶段后的有效执行周期
+        let discounted_exec_cycle = self.exec_cycle - drain_cycle;
+        // 9. 累计符合条件的额外排空周期
+        if self.exec_cycle > mem_exec_cycle && self.pes[pe_idx].config_unchanged {
+            self.drain_cycles[pe_idx] += self.exec_cycle - max(discounted_exec_cycle, mem_exec_cycle);
+        }
+    }
+}
+```
+
+`mem_finish_cycle` 记录内存操作（数据读写）完成的周期。若未记录（`is_none()`），**根据 PE 是否有任务，计算并记录相关性能指标（如延迟、缓存占用），并设置内存操作的预计完成周期**。
+
+- 计算任务延迟：取 “实际执行周期” 和 “内存传输周期” 的最大值（确保覆盖最慢的环节），并更新调度器的延迟跟踪器。
+- 计算并设置 `mem_finish_cycle`：任务开始周期 + 内存传输所需周期（根据带宽计算），标记内存操作何时完成。
+
+这段代码通过区分 “有效计算周期”“内存操作周期” 和 “排空周期”，精确统计 PE 在无新任务输入、仅处理剩余数据时的额外耗时，帮助分析硬件资源在排空阶段的利用率，为优化任务调度（如减少排空时间）提供数据支持。
+
+**Step3.2 等待内存操作完成（Pending Cycle 处理）**
+
+```rust
+// Wait to catch the pending cycle.
+if self.pes[pe_idx].mem_finish_cycle.is_some()
+    && *self.pes[pe_idx].mem_finish_cycle.as_ref().unwrap() > self.exec_cycle
+{
+    continue;
+}
+```
+
+确保 PE 的内存操作（如数据读取 / 写入）完全完成后，再进行后续的任务收尾和新任务分配。
+
+**Step3.3 收集输出部分和，上一个任务信息，交换出已完成行的部分和**
+
+主要涉及scheduler的信息更新
+
+**Step3.4分配新任务（Assign new tasks）**
+
+```rust
+let task = self.scheduler.assign_task(&mut self.pes[pe_idx], &mut self.a_matrix, self.exec_cycle); // 分配任务
+let latency = self.pes[pe_idx].set_task(task); // 配置PE并获取延迟
+self.a_pending_cycle[pe_idx] += latency; // 更新挂起周期
+```
+
+完成收尾工作后，为 PE 分配新任务，并配置 PE 状态。
+
+#### Step4: 打印任务调试信息
+
+若 PE 有任务，打印当前任务的块 / 窗口锚点、形状、通道分配等调试信息。
+
+```rust
+if self.pes[pe_idx].task.is_some() {//print...}
+```
+
+#### Step5: 流缓冲区数据获取（Stream Buffer Fetch）
+
+根据流缓冲区（`stream_buffers`）的剩余空间，从内存 / 缓存读取 B 矩阵数据并推入缓冲区。为乘法器阵列提供计算所需的 B 元素，确保数据供应。
+
+```rust
+// 遍历通道以分别处理每个通道的数据获取。
+for lane_idx in 0..self.lane_num {
+    //  计算当前流缓冲区已使用空间（sb_len）
+    let sb_len = self.pes[pe_idx].stream_buffers[lane_idx]
+        .iter()
+        .filter(|e| e.idx[0] != usize::MAX)
+        .count();
+    // 计算可读取的最大元素数量（rb_num）
+    let rb_num = self.pes[pe_idx].stream_buffer_size - sb_len;
+    // 从存储系统读取 B 矩阵元素（stream_b_row）
+    let bs = self.stream_b_row(pe_idx, lane_idx, rb_num, self.exec_cycle);
+    // 将读取的元素推入流缓冲区
+    self.pes[pe_idx].push_stream_buffer(lane_idx, bs);
+}
+```
+
+#### Step6: 计算生产阶段（Production Phase）
+
+- **更新满标志**：根据部分和缓冲区（`psum_buffers`）的占用情况，设置满标志（`full_flags`），控制数据流入。
+- **读取 B 元素**：从流缓冲区弹出 B 元素，送入乘法器阵列。
+- **执行乘法运算**：乘法器阵列根据 A 元素与 B 元素计算乘积，结果推入部分和缓冲区。
+- **统计乘法器利用率**：计算本周期内乘法器的使用率（`mult_util`）和活跃周期（`active_cycle`）。
+
+#### Step7: 部分和收集阶段（Collect Psum Phase）
+
+- **更新尾标志**：根据部分和缓冲区中的数据索引，更新尾标志（`tail_flags`），控制部分和弹出时机。
+- **收集部分和**：从部分和缓冲区弹出数据，推入排序网络（`sorting_network`）。
+
+#### Step8: 排序与合并阶段（Sort & Merge Phase）
+
+- **排序操作**：排序网络弹出排序后的元素，送入合并树（`merge_tree`）。
+- **合并操作**：合并树弹出合并后的部分和（累加相同索引的结果），调用 `write_psums` 写入内存 / 缓存。
+
+#### Step9: 更新任务内存流量
+
+- **操作**：统计本周期内 PE 的内存操作量（读写次数），累加到当前任务的 `memory_traffic`。
+- **目的**：跟踪任务的内存开销，用于后续性能分析和调度优化。
