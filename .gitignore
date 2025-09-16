@@ -7,3 +7,4 @@ perf.*
 *.gz
 sweep_suitesparse
 job2run
+/spadaenv
